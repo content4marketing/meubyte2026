@@ -27,8 +27,8 @@ interface TemplateField {
     id: string
     is_required: boolean
     display_order: number
-    base_fields?: FieldMeta | null
-    org_fields?: FieldMeta | null
+    base_fields?: FieldMeta | FieldMeta[] | null
+    org_fields?: FieldMeta | FieldMeta[] | null
 }
 
 interface FieldMeta {
@@ -159,7 +159,9 @@ export default function LinkPage() {
             if (fieldsError) throw fieldsError
 
             const normalized = (fieldsData || []).map((field: TemplateField) => {
-                const meta = field.base_fields || field.org_fields
+                const baseField = Array.isArray(field.base_fields) ? field.base_fields[0] : field.base_fields
+                const orgField = Array.isArray(field.org_fields) ? field.org_fields[0] : field.org_fields
+                const meta = baseField || orgField
                 return {
                     id: field.id,
                     slug: meta?.slug || field.id,
