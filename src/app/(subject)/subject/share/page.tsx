@@ -2,29 +2,65 @@
 
 export const dynamic = 'force-dynamic'
 
-import { useState, useEffect } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, Button, Alert } from '@/components/ui'
-import { Copy, MessageCircle, CheckCircle, Share2, Clock, Lock } from 'lucide-react'
+import { Copy, MessageCircle, CheckCircle, Clock, Lock } from 'lucide-react'
+import QRCode from 'qrcode'
 import { createClient } from '@/lib/supabase/client'
-import { getWalletData, hasWalletData, getAnonId, WalletData } from '@/lib/wallet'
+import { getWalletData, hasWalletData, WalletData } from '@/lib/wallet'
 import { generateShareKey, exportKeyToString, encryptShareData } from '@/lib/crypto/zk-share'
-import { hashToken } from '@/lib/utils/tokens'
+
+interface SharePayload {
+    meta: {
+        createdAt: string
+        expiresAt: string
+        version: number
+    }
+    fields: Array<{
+        slug: string
+        label: string
+        value: string
+    }>
+}
 
 // Generate a random ID for the share (UUID v4 style)
 function generateShareId() {
     return crypto.randomUUID()
 }
 
+function formatLabel(slug: string) {
+    const labels: Record<string, string> = {
+        full_name: 'Nome Completo',
+        cpf: 'CPF',
+        email: 'E-mail',
+        phone: 'Telefone',
+        birth_date: 'Data de Nascimento',
+        address_line: 'Endereço',
+        city: 'Cidade',
+        state: 'Estado',
+        postal_code: 'CEP'
+    }
+    return labels[slug] || slug.replace(/_/g, ' ')
+}
+
 export default function SharePage() {
-    const supabase = createClient()
+    const supabase = useMemo(() => createClient(), [])
+    const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
+    const keyRef = useRef<CryptoKey | null>(null)
 
     const [walletData, setWalletData] = useState<WalletData>({})
     const [hasData, setHasData] = useState(false)
     const [loading, setLoading] = useState(true)
     const [shareId, setShareId] = useState<string | null>(null)
     const [shareUrl, setShareUrl] = useState<string | null>(null)
+    const [qrDataUrl, setQrDataUrl] = useState<string | null>(null)
     const [copied, setCopied] = useState(false)
     const [generating, setGenerating] = useState(false)
+    const [sending, setSending] = useState(false)
+    const [receiverReady, setReceiverReady] = useState(false)
+    const [sent, setSent] = useState(false)
+    const [expiresAt, setExpiresAt] = useState<number | null>(null)
+    const [remaining, setRemaining] = useState<string | null>(null)
     const [error, setError] = useState<string | null>(null)
 
     useEffect(() => {
@@ -38,71 +74,130 @@ export default function SharePage() {
         loadData()
     }, [])
 
+    useEffect(() => {
+        if (!expiresAt) return
+
+        const interval = setInterval(() => {
+            const diff = expiresAt - Date.now()
+            if (diff <= 0) {
+                setRemaining('0:00')
+                clearInterval(interval)
+                return
+            }
+            const minutes = Math.floor(diff / 60000)
+            const seconds = Math.floor((diff % 60000) / 1000)
+            setRemaining(`${minutes}:${seconds.toString().padStart(2, '0')}`)
+        }, 1000)
+
+        return () => clearInterval(interval)
+    }, [expiresAt])
+
+    useEffect(() => {
+        return () => {
+            if (channelRef.current) {
+                supabase.removeChannel(channelRef.current)
+                channelRef.current = null
+            }
+        }
+    }, [supabase])
+
+    const setupChannel = (id: string) => {
+        if (channelRef.current) {
+            supabase.removeChannel(channelRef.current)
+        }
+
+        const channel = supabase.channel(`public:${id}`, {
+            config: { broadcast: { self: false } }
+        })
+
+        channel.on('broadcast', { event: 'ready' }, () => {
+            setReceiverReady(true)
+        })
+
+        channel.subscribe()
+        channelRef.current = channel
+    }
+
     const generateLink = async () => {
         setGenerating(true)
         setError(null)
+        setSent(false)
+        setReceiverReady(false)
 
         try {
             // 1. Generate local encryption key (never sent to server)
             const key = await generateShareKey()
             const keyString = await exportKeyToString(key)
+            keyRef.current = key
 
             // 2. Generate Share ID (Public ID)
             const id = generateShareId()
 
-            // 3. Encrypt data with the key
-            // We wrap the wallet data in a structure that supports future file uploads (blobs)
-            const payload = {
-                data: walletData,
-                timestamp: Date.now(),
-                version: 1
-            }
+            // 3. Expiration: 10 minutes
+            const expiresAtMs = Date.now() + 10 * 60 * 1000
 
-            const encrypted = await encryptShareData(payload, key)
-
-            // 4. Get anonymous ID for ownership
-            const anonId = await getAnonId()
-
-            // 5. Encrypt data for storage (base64 of ciphertext+iv combined or JSON)
-            // For simplicity let's store JSON string of the encrypted object
-            const storedBlob = JSON.stringify(encrypted)
-
-            // 6. Expiration: 30 minutes
-            const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString()
-
-            // 7. Save to Supabase
-            // Note: We use the ID as the lookup key. token_hash is reused or we can just use ID.
-            // To minimal changes, we'll hash the ID to store in token_hash (just to satisfy constraint)
-            // client-side hashing of public ID is fine.
-            const idHash = await hashToken(id)
-
-            const { error: dbError } = await supabase
-                .from('subject_shares')
-                .insert({
-                    token_hash: idHash, // Using ID hash as lookup index
-                    subject_anon_id: anonId,
-                    data_encrypted: window.btoa(storedBlob), // Store as base64 string
-                    expires_at: expiresAt
-                })
-
-            if (dbError) {
-                console.error('Database error:', dbError)
-                throw new Error('Erro ao salvar compartilhamento')
-            }
-
-            // 8. Construct URL with Hash Fragment
-            // Format: /public/view/<ID>#key=<KEY>
+            // 4. Construct URL with hash fragment (key) and exp query
             const baseUrl = window.location.origin
-            const url = `${baseUrl}/public/view/${id}#key=${keyString}`
+            const url = `${baseUrl}/public/view/${id}?exp=${expiresAtMs}#key=${keyString}`
 
             setShareId(id)
             setShareUrl(url)
+            setExpiresAt(expiresAtMs)
+            setupChannel(id)
 
+            const qr = await QRCode.toDataURL(url, {
+                margin: 1,
+                width: 280,
+                color: { dark: '#0f172a', light: '#ffffff' }
+            })
+            setQrDataUrl(qr)
         } catch (err) {
             console.error('Error generating link:', err)
             setError(err instanceof Error ? err.message : 'Erro ao gerar link')
         } finally {
             setGenerating(false)
+        }
+    }
+
+    const sendPayload = async () => {
+        if (!keyRef.current || !channelRef.current || !shareId || !shareUrl) return
+        if (expiresAt && Date.now() > expiresAt) {
+            setError('Link expirado. Gere um novo.')
+            return
+        }
+
+        setSending(true)
+        setError(null)
+
+        try {
+            const filledFields = Object.entries(walletData).filter(([_, value]) => value)
+            const payload: SharePayload = {
+                meta: {
+                    createdAt: new Date().toISOString(),
+                    expiresAt: new Date(expiresAt || Date.now()).toISOString(),
+                    version: 1
+                },
+                fields: filledFields.map(([key, value]) => ({
+                    slug: key,
+                    label: formatLabel(key),
+                    value: value as string
+                }))
+            }
+
+            const encrypted = await encryptShareData(payload, keyRef.current)
+
+            await channelRef.current.send({
+                type: 'broadcast',
+                event: 'payload',
+                payload: encrypted
+            })
+
+            setSent(true)
+        } catch (err) {
+            console.error('Error sending payload:', err)
+            setError(err instanceof Error ? err.message : 'Erro ao enviar dados')
+        } finally {
+            setSending(false)
         }
     }
 
@@ -117,7 +212,7 @@ export default function SharePage() {
     const shareWhatsApp = () => {
         if (shareUrl) {
             const message = encodeURIComponent(
-                `Acesse meus dados (protegidos com criptografia de ponta a ponta) através deste link:\n${shareUrl}\n\nVálido por 30 minutos.`
+                `Acesse meus dados (protegidos com criptografia de ponta a ponta) através deste link:\n${shareUrl}\n\nVálido por 10 minutos.`
             )
             window.open(`https://wa.me/?text=${message}`, '_blank')
         }
@@ -203,8 +298,14 @@ export default function SharePage() {
                                 Link Seguro Gerado!
                             </h2>
                             <p className="text-gray-600 text-sm mb-4">
-                                A chave de acesso está incluída no link
+                                Compartilhe o link ou QR Code com o receptor
                             </p>
+
+                            {qrDataUrl && (
+                                <div className="bg-white p-3 rounded-xl inline-block shadow-sm mb-4">
+                                    <img src={qrDataUrl} alt="QR Code" className="h-48 w-48" />
+                                </div>
+                            )}
 
                             <div className="bg-gray-50 rounded-lg p-3 mb-6 break-all text-xs text-gray-600 font-mono border border-gray-200">
                                 {shareUrl}
@@ -229,12 +330,29 @@ export default function SharePage() {
                                     WhatsApp
                                 </Button>
                             </div>
+
+                            <div className="mt-4">
+                                <Alert variant={receiverReady ? 'success' : 'info'}>
+                                    {receiverReady
+                                        ? 'Receptor conectado. Envie os dados agora.'
+                                        : 'Aguardando o receptor abrir o link.'}
+                                </Alert>
+                                <Button
+                                    className="w-full mt-3"
+                                    onClick={sendPayload}
+                                    loading={sending}
+                                    disabled={!receiverReady || sent}
+                                >
+                                    {sent ? 'Dados enviados' : 'Enviar dados agora'}
+                                </Button>
+                            </div>
                         </CardContent>
                     </Card>
 
                     <Alert variant="warning">
                         <Clock className="h-4 w-4 inline mr-2" />
-                        Este link expira em <strong>30 minutos</strong>.
+                        Este link expira em <strong>10 minutos</strong>.
+                        {remaining && <span className="ml-1">Tempo restante: {remaining}.</span>}
                     </Alert>
 
                     <Button
@@ -243,6 +361,11 @@ export default function SharePage() {
                         onClick={() => {
                             setShareId(null)
                             setShareUrl(null)
+                            setQrDataUrl(null)
+                            setExpiresAt(null)
+                            setRemaining(null)
+                            setReceiverReady(false)
+                            setSent(false)
                         }}
                     >
                         Gerar Novo Link

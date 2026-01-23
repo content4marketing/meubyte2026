@@ -11,8 +11,6 @@ import {
     MapPin,
     Calendar,
     Edit2,
-    Save,
-    X,
     Shield,
     CheckCircle,
     Download,
@@ -62,11 +60,13 @@ const FIELD_CONFIG = [
 export default function WalletPage() {
     const router = useRouter()
     const supabase = createClient()
+    const editInputRef = useRef<HTMLInputElement>(null)
+    const isCommittingRef = useRef(false)
 
     const [data, setData] = useState<WalletData>({})
     const [editing, setEditing] = useState<string | null>(null)
     const [editValue, setEditValue] = useState('')
-    const [saving, setSaving] = useState(false)
+    const [originalValue, setOriginalValue] = useState('')
     const [saved, setSaved] = useState(false)
     const [error, setError] = useState<string | null>(null)
 
@@ -113,42 +113,71 @@ export default function WalletPage() {
 
     const startEditing = (key: string) => {
         setEditing(key)
-        setEditValue(data[key] || '')
+        const currentValue = data[key] || ''
+        setEditValue(currentValue)
+        setOriginalValue(currentValue)
         setError(null)
     }
 
     const cancelEditing = () => {
         setEditing(null)
-        setEditValue('')
+        setEditValue(originalValue)
+        setOriginalValue('')
         setError(null)
     }
 
-    const saveField = async () => {
+    const commitEdit = async () => {
         if (!editing) return
+
+        setError(null)
+
+        const currentValue = data[editing] || ''
+        if (editValue === currentValue) {
+            setEditing(null)
+            setEditValue('')
+            setOriginalValue('')
+            setError(null)
+            return
+        }
 
         // Validation
         if (editing === 'cpf' && editValue && !validateCPF(editValue)) {
             setError('CPF inválido')
+            setTimeout(() => editInputRef.current?.focus(), 0)
             return
         }
         if (editing === 'email' && editValue && !validateEmail(editValue)) {
             setError('E-mail inválido')
+            setTimeout(() => editInputRef.current?.focus(), 0)
             return
         }
 
-        setSaving(true)
+        if (isCommittingRef.current) return
+        isCommittingRef.current = true
         try {
             const newData = { ...data, [editing]: editValue }
             await saveWalletData(newData)
             setData(newData)
             setEditing(null)
             setEditValue('')
+            setOriginalValue('')
             setSaved(true)
             setTimeout(() => setSaved(false), 2000)
         } catch (err) {
             setError('Erro ao salvar')
         } finally {
-            setSaving(false)
+            isCommittingRef.current = false
+        }
+    }
+
+    const handleEditKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+        if (event.key === 'Enter') {
+            event.preventDefault()
+            commitEdit()
+        }
+        if (event.key === 'Escape') {
+            event.preventDefault()
+            cancelEditing()
         }
     }
 
@@ -431,19 +460,15 @@ export default function WalletPage() {
                                             type={field.type}
                                             value={editValue}
                                             onChange={(e) => setEditValue(e.target.value)}
+                                            onBlur={commitEdit}
+                                            onKeyDown={handleEditKeyDown}
                                             error={error || undefined}
                                             autoFocus
+                                            ref={editInputRef}
                                         />
-                                        <div className="flex gap-2">
-                                            <Button size="sm" onClick={saveField} loading={saving}>
-                                                <Save className="h-4 w-4" />
-                                                Salvar
-                                            </Button>
-                                            <Button size="sm" variant="ghost" onClick={cancelEditing}>
-                                                <X className="h-4 w-4" />
-                                                Cancelar
-                                            </Button>
-                                        </div>
+                                        <p className="text-xs text-gray-500">
+                                            Salva automaticamente ao sair do campo.
+                                        </p>
                                     </div>
                                 ) : (
                                     <button

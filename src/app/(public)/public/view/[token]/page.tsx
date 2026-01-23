@@ -2,49 +2,70 @@
 
 export const dynamic = 'force-dynamic'
 
-import { useEffect, useState } from 'react'
-import { useParams } from 'next/navigation'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useParams, useSearchParams } from 'next/navigation'
 import { Card, CardContent, CardHeader, CardTitle, Alert } from '@/components/ui'
 import { Shield, Clock, User, AlertTriangle, CheckCircle, Lock } from 'lucide-react'
 import { createClient } from '@/lib/supabase/client'
-import { hashToken } from '@/lib/utils/tokens'
 import { formatCPF, formatPhone, formatDate } from '@/lib/utils'
 import { importKeyFromString, decryptShareData } from '@/lib/crypto/zk-share'
 
-interface SharedData {
-    full_name?: string
-    cpf?: string
-    email?: string
-    phone?: string
-    birth_date?: string
-    address_line?: string
-    city?: string
-    state?: string
-    postal_code?: string
-    [key: string]: string | undefined
-}
-
 interface SharePayload {
-    data: SharedData
-    timestamp: number
-    version: number
+    meta: {
+        createdAt: string
+        expiresAt: string
+        version: number
+    }
+    fields: Array<{
+        slug: string
+        label: string
+        value: string
+    }>
 }
 
 export default function PublicViewPage() {
     const params = useParams()
+    const searchParams = useSearchParams()
     const idArg = params.token as string // URL param is actually the ID now
-    const supabase = createClient()
+    const supabase = useMemo(() => createClient(), [])
+    const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
 
-    const [step, setStep] = useState<'validating' | 'viewing' | 'expired' | 'error'>('validating')
-    const [data, setData] = useState<SharedData | null>(null)
+    const [step, setStep] = useState<'waiting' | 'viewing' | 'expired' | 'error'>('waiting')
+    const [data, setData] = useState<SharePayload | null>(null)
     const [error, setError] = useState<string | null>(null)
     const [expiresIn, setExpiresIn] = useState<string | null>(null)
+    const [expiresAt, setExpiresAt] = useState<number | null>(null)
 
     useEffect(() => {
-        validateAndLoad()
-    }, [])
+        setupChannel()
+        return () => {
+            if (channelRef.current) {
+                supabase.removeChannel(channelRef.current)
+                channelRef.current = null
+            }
+        }
+    }, [supabase, idArg, searchParams])
 
-    const validateAndLoad = async () => {
+    useEffect(() => {
+        if (!expiresAt) return
+        const interval = setInterval(() => {
+            const diff = expiresAt - Date.now()
+            if (diff <= 0) {
+                setStep('expired')
+                setExpiresIn('0 minutos')
+                setData(null)
+                clearInterval(interval)
+                return
+            }
+
+            const mins = Math.ceil(diff / 60000)
+            setExpiresIn(`${mins} minutos`)
+        }, 1000)
+
+        return () => clearInterval(interval)
+    }, [expiresAt])
+
+    const setupChannel = async () => {
         try {
             // 1. Get Key from URL Hash
             // window.location.hash returns "#key=..."
@@ -57,63 +78,50 @@ export default function PublicViewPage() {
 
             const keyString = keyMatch[1]
 
-            // 2. Fetch encrypted blob from Supabase using ID
-            // We use the ID directly to find the share. 
-            // Compatibility: The old code used token_hash. Now we use ID hash as lookup or just ID.
-            // In SharePage we stored token_hash = hash(ID). So we must hash the ID here to find it.
-            const idHash = await hashToken(idArg)
+            // 2. Resolve expiration from query param
+            const expParam = searchParams.get('exp')
+            const expMs = expParam ? Number(expParam) : Date.now() + 10 * 60 * 1000
 
-            const { data: shareData, error: dbError } = await supabase
-                .from('subject_shares')
-                .select('*')
-                .eq('token_hash', idHash)
-                .single()
-
-            if (dbError || !shareData) {
-                console.error('Database error:', dbError)
-                throw new Error('Link não encontrado ou já expirou.')
+            if (Number.isNaN(expMs)) {
+                throw new Error('Link inválido.')
             }
 
-            // Calculate remaining time
-            const expiresAt = new Date(shareData.expires_at)
-            const now = new Date()
-
-            if (expiresAt < now) {
+            if (expMs < Date.now()) {
                 throw new Error('Este link expirou. Solicite um novo ao titular.')
             }
 
-            const diffMs = expiresAt.getTime() - now.getTime()
-            const diffMins = Math.ceil(diffMs / (1000 * 60))
-            setExpiresIn(`${diffMins} minutos`)
+            setExpiresAt(expMs)
 
-            // 3. Decrypt data client-side
-            try {
-                // Import Key
-                const key = await importKeyFromString(keyString)
+            const key = await importKeyFromString(keyString)
 
-                // Parse stored blob (base64 string -> JSON object {iv, ciphertext})
-                const encryptedJsonString = window.atob(shareData.data_encrypted)
-                const encryptedData = JSON.parse(encryptedJsonString)
+            // 3. Subscribe to realtime channel
+            const channel = supabase.channel(`public:${idArg}`, {
+                config: { broadcast: { self: false } }
+            })
 
-                // Decrypt
-                const decryptedPayload = await decryptShareData(encryptedData, key) as SharePayload
+            channel.on('broadcast', { event: 'payload' }, async (event) => {
+                try {
+                    const decryptedPayload = await decryptShareData(event.payload, key) as SharePayload
+                    setData(decryptedPayload)
+                    setStep('viewing')
+                } catch (err) {
+                    console.error('Decryption error:', err)
+                    setError('Falha na decifragem. A chave pode estar incorreta.')
+                    setStep('error')
+                }
+            })
 
-                setData(decryptedPayload.data)
-            } catch (err) {
-                console.error('Decryption error:', err)
-                throw new Error('Falha na decifragem. A chave pode estar incorreta ou os dados corrompidos.')
-            }
+            channel.subscribe((status) => {
+                if (status === 'SUBSCRIBED') {
+                    channel.send({
+                        type: 'broadcast',
+                        event: 'ready',
+                        payload: { at: new Date().toISOString() }
+                    })
+                }
+            })
 
-            // Update access count
-            await supabase
-                .from('subject_shares')
-                .update({
-                    accessed_at: now.toISOString(),
-                    access_count: (shareData.access_count || 0) + 1
-                })
-                .eq('id', shareData.id)
-
-            setStep('viewing')
+            channelRef.current = channel
 
         } catch (err) {
             setError(err instanceof Error ? err.message : 'Erro ao carregar dados')
@@ -121,35 +129,20 @@ export default function PublicViewPage() {
         }
     }
 
-    const formatValue = (key: string, value: string) => {
-        if (key === 'cpf') return formatCPF(value)
-        if (key === 'phone') return formatPhone(value)
-        if (key === 'birth_date') return formatDate(value)
+    const formatValue = (slug: string, value: string) => {
+        if (slug === 'cpf') return formatCPF(value)
+        if (slug === 'phone') return formatPhone(value)
+        if (slug === 'birth_date') return formatDate(value)
         return value
     }
 
-    const getLabel = (key: string): string => {
-        const labels: Record<string, string> = {
-            full_name: 'Nome Completo',
-            cpf: 'CPF',
-            email: 'E-mail',
-            phone: 'Telefone',
-            birth_date: 'Data de Nascimento',
-            address_line: 'Endereço',
-            city: 'Cidade',
-            state: 'Estado',
-            postal_code: 'CEP'
-        }
-        return labels[key] || key.replace(/_/g, ' ')
-    }
-
-    if (step === 'validating') {
+    if (step === 'waiting') {
         return (
             <div className="py-16 text-center">
                 <div className="animate-spin h-8 w-8 border-4 border-blue-600 border-t-transparent rounded-full mx-auto mb-4"></div>
                 <div className="flex items-center justify-center gap-2 text-gray-600">
                     <Lock className="h-4 w-4" />
-                    <p>Decifrando dados com segurança...</p>
+                    <p>Aguardando envio seguro dos dados...</p>
                 </div>
             </div>
         )
@@ -176,7 +169,7 @@ export default function PublicViewPage() {
     }
 
     // Filter out empty values
-    const filledData = data ? Object.entries(data).filter(([_, value]) => value) : []
+    const filledData = data ? data.fields.filter((field) => field.value) : []
 
     return (
         <div className="py-6 space-y-6">
@@ -197,7 +190,7 @@ export default function PublicViewPage() {
                             </p>
                             <p className="text-sm text-green-600">
                                 <Clock className="h-3 w-3 inline mr-1" />
-                                Expira em {expiresIn || '30 minutos'}
+                                Expira em {expiresIn || '10 minutos'}
                             </p>
                         </div>
                     </div>
@@ -217,11 +210,11 @@ export default function PublicViewPage() {
                 <CardContent className="p-0">
                     <div className="divide-y divide-gray-100">
                         {filledData.length > 0 ? (
-                            filledData.map(([key, value]) => (
-                                <div key={key} className="px-6 py-4 flex justify-between items-center">
-                                    <span className="text-gray-500">{getLabel(key)}</span>
+                            filledData.map((field) => (
+                                <div key={field.slug} className="px-6 py-4 flex justify-between items-center">
+                                    <span className="text-gray-500">{field.label}</span>
                                     <span className="font-medium text-gray-900">
-                                        {formatValue(key, value!)}
+                                        {formatValue(field.slug, field.value)}
                                     </span>
                                 </div>
                             ))
@@ -237,7 +230,7 @@ export default function PublicViewPage() {
             {/* Warning */}
             <Alert variant="warning">
                 <Shield className="h-4 w-4 inline mr-2" />
-                Este acesso foi <strong>registrado</strong>.
+                Este acesso é efêmero.
                 Os dados foram decifrados apenas neste dispositivo.
             </Alert>
         </div>
