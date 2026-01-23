@@ -5,8 +5,12 @@
 
 const TOKEN_ITERATIONS = 120_000
 
-function encode(value: string): Uint8Array {
-    return new TextEncoder().encode(value)
+function toArrayBuffer(view: Uint8Array): ArrayBuffer {
+    return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength) as ArrayBuffer
+}
+
+function encode(value: string): ArrayBuffer {
+    return toArrayBuffer(new TextEncoder().encode(value))
 }
 
 export async function deriveTokenKey(token: string, slug: string): Promise<CryptoKey> {
