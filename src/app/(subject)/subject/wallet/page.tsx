@@ -1,9 +1,7 @@
 'use client'
 
 import { useState, useEffect, useRef } from 'react'
-import { useRouter } from 'next/navigation'
-import { createClient } from '@/lib/supabase/client'
-import { Card, CardContent, CardHeader, CardTitle, Button, Input, Alert } from '@/components/ui'
+import { Card, CardContent, CardHeader, CardTitle, Input, Alert } from '@/components/ui'
 import {
     User,
     Phone,
@@ -11,16 +9,7 @@ import {
     MapPin,
     Calendar,
     Edit2,
-    Shield,
-    CheckCircle,
-    Download,
-    Upload,
-    AlertTriangle,
-    Cloud,
-    LogOut,
-    RefreshCw,
-    ArrowUp,
-    ArrowDown
+    Shield
 } from 'lucide-react'
 import {
     getWalletData,
@@ -28,22 +17,7 @@ import {
     initWallet,
     WalletData
 } from '@/lib/wallet'
-import {
-    exportBackup,
-    downloadBackup,
-    getBackupFilename,
-    validateBackupFile,
-    parseBackupFile,
-    decryptBackup,
-    restoreFromBackup,
-    readFileAsText
-} from '@/lib/wallet/backup'
-import {
-    syncWalletToCloud,
-    syncWalletFromCloud,
-    hasCloudData
-} from '@/lib/wallet/sync'
-import { formatCPF, formatPhone, validateCPF, validateEmail } from '@/lib/utils'
+import { formatCPF, formatPhone, formatDate, validateCPF, validateEmail } from '@/lib/utils'
 
 const FIELD_CONFIG = [
     { key: 'full_name', label: 'Nome Completo', icon: User, type: 'text' },
@@ -57,33 +31,58 @@ const FIELD_CONFIG = [
     { key: 'postal_code', label: 'CEP', icon: MapPin, type: 'text' },
 ]
 
+function formatBirthDateDisplay(value: string) {
+    if (!value) return ''
+    const isoMatch = value.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+    if (isoMatch) {
+        return `${isoMatch[3]}/${isoMatch[2]}/${isoMatch[1]}`
+    }
+    const slashMatch = value.match(/^(\d{2})[\/-](\d{2})[\/-](\d{4})$/)
+    if (slashMatch) {
+        return `${slashMatch[1]}/${slashMatch[2]}/${slashMatch[3]}`
+    }
+    return value
+}
+
+function normalizeValue(key: string, value: string): string | null {
+    if (key !== 'birth_date') return value
+    if (!value) return ''
+    if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value
+    const match = value.match(/^(\d{2})[\/-](\d{2})[\/-](\d{4})$/)
+    if (!match) return null
+    const day = Number(match[1])
+    const month = Number(match[2])
+    const year = Number(match[3])
+    if (!day || !month || !year) return null
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null
+    const date = new Date(Date.UTC(year, month - 1, day))
+    if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
+        return null
+    }
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+}
+
+function formatBirthDateInput(value: string) {
+    const digits = value.replace(/\D/g, '').slice(0, 8)
+    const parts = []
+    if (digits.length >= 2) parts.push(digits.slice(0, 2))
+    if (digits.length >= 4) parts.push(digits.slice(2, 4))
+    if (digits.length > 4) parts.push(digits.slice(4))
+    return parts.join('/')
+}
+
 export default function WalletPage() {
-    const router = useRouter()
-    const supabase = createClient()
     const editInputRef = useRef<HTMLInputElement>(null)
+    const datePickerRef = useRef<HTMLInputElement>(null)
     const isCommittingRef = useRef(false)
+    const savedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
     const [data, setData] = useState<WalletData>({})
     const [editing, setEditing] = useState<string | null>(null)
     const [editValue, setEditValue] = useState('')
     const [originalValue, setOriginalValue] = useState('')
-    const [saved, setSaved] = useState(false)
+    const [savedField, setSavedField] = useState<string | null>(null)
     const [error, setError] = useState<string | null>(null)
-
-    // Auth state
-    const [user, setUser] = useState<any>(null)
-    const [hasCloud, setHasCloud] = useState(false)
-
-    // Backup states
-    const [showBackupModal, setShowBackupModal] = useState<'export' | 'import' | 'sync' | null>(null)
-    const [backupPassphrase, setBackupPassphrase] = useState('')
-    const [backupConfirmPassphrase, setBackupConfirmPassphrase] = useState('')
-    const [backupError, setBackupError] = useState<string | null>(null)
-    const [backupLoading, setBackupLoading] = useState(false)
-    const [importFile, setImportFile] = useState<File | null>(null)
-    const [importPreview, setImportPreview] = useState<WalletData | null>(null)
-    const [syncMode, setSyncMode] = useState<'push' | 'pull' | null>(null)
-    const fileInputRef = useRef<HTMLInputElement>(null)
 
     useEffect(() => {
         const loadWallet = async () => {
@@ -92,30 +91,24 @@ export default function WalletPage() {
             setData(walletData)
         }
 
-        const checkAuth = async () => {
-            const { data: { user } } = await supabase.auth.getUser()
-            setUser(user)
-            if (user) {
-                const has = await hasCloudData()
-                setHasCloud(has)
-            }
-        }
-
         loadWallet()
-        checkAuth()
     }, [])
 
-    const handleLogout = async () => {
-        await supabase.auth.signOut()
-        setUser(null)
-        router.refresh()
-    }
+    useEffect(() => {
+        return () => {
+            if (savedTimeoutRef.current) {
+                clearTimeout(savedTimeoutRef.current)
+                savedTimeoutRef.current = null
+            }
+        }
+    }, [])
 
     const startEditing = (key: string) => {
         setEditing(key)
         const currentValue = data[key] || ''
-        setEditValue(currentValue)
-        setOriginalValue(currentValue)
+        const displayValue = key === 'birth_date' ? formatBirthDateDisplay(currentValue) : currentValue
+        setEditValue(displayValue)
+        setOriginalValue(displayValue)
         setError(null)
     }
 
@@ -126,13 +119,33 @@ export default function WalletPage() {
         setError(null)
     }
 
-    const commitEdit = async () => {
+    const markSaved = (key: string) => {
+        setSavedField(key)
+        if (savedTimeoutRef.current) {
+            clearTimeout(savedTimeoutRef.current)
+        }
+        savedTimeoutRef.current = setTimeout(() => {
+            setSavedField(null)
+            savedTimeoutRef.current = null
+        }, 1500)
+    }
+
+    const commitEdit = async (overrideValue?: string) => {
         if (!editing) return
 
         setError(null)
 
         const currentValue = data[editing] || ''
-        if (editValue === currentValue) {
+        const candidateValue = (overrideValue ?? editValue).trim()
+        const normalizedValue = normalizeValue(editing, candidateValue)
+
+        if (normalizedValue === null) {
+            setError('Data inválida')
+            setTimeout(() => editInputRef.current?.focus(), 0)
+            return
+        }
+
+        if (normalizedValue === currentValue) {
             setEditing(null)
             setEditValue('')
             setOriginalValue('')
@@ -155,14 +168,14 @@ export default function WalletPage() {
         if (isCommittingRef.current) return
         isCommittingRef.current = true
         try {
-            const newData = { ...data, [editing]: editValue }
+            const savedKey = editing
+            const newData = { ...data, [editing]: normalizedValue }
             await saveWalletData(newData)
             setData(newData)
             setEditing(null)
             setEditValue('')
             setOriginalValue('')
-            setSaved(true)
-            setTimeout(() => setSaved(false), 2000)
+            markSaved(savedKey)
         } catch (err) {
             setError('Erro ao salvar')
         } finally {
@@ -185,140 +198,8 @@ export default function WalletPage() {
         if (!value) return ''
         if (key === 'cpf') return formatCPF(value)
         if (key === 'phone') return formatPhone(value)
+        if (key === 'birth_date') return formatDate(value)
         return value
-    }
-
-    // Backup functions
-    const handleExportBackup = async () => {
-        if (backupPassphrase.length < 8) {
-            setBackupError('A senha deve ter pelo menos 8 caracteres')
-            return
-        }
-        if (backupPassphrase !== backupConfirmPassphrase) {
-            setBackupError('As senhas não coincidem')
-            return
-        }
-
-        setBackupLoading(true)
-        setBackupError(null)
-
-        try {
-            const blob = await exportBackup(backupPassphrase)
-            downloadBackup(blob, getBackupFilename())
-            setShowBackupModal(null)
-            setBackupPassphrase('')
-            setBackupConfirmPassphrase('')
-            setSaved(true)
-            setTimeout(() => setSaved(false), 2000)
-        } catch (err) {
-            setBackupError(err instanceof Error ? err.message : 'Erro ao exportar')
-        } finally {
-            setBackupLoading(false)
-        }
-    }
-
-    const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        const file = e.target.files?.[0]
-        if (!file) return
-
-        setImportFile(file)
-        setImportPreview(null)
-        setBackupError(null)
-
-        try {
-            const content = await readFileAsText(file)
-            const validation = validateBackupFile(content)
-
-            if (!validation.valid) {
-                setBackupError(validation.error || 'Arquivo inválido')
-                return
-            }
-        } catch (err) {
-            setBackupError('Erro ao ler arquivo')
-        }
-    }
-
-    const handleDecryptBackup = async () => {
-        if (!importFile || backupPassphrase.length < 8) {
-            setBackupError('Selecione um arquivo e informe a senha')
-            return
-        }
-
-        setBackupLoading(true)
-        setBackupError(null)
-
-        try {
-            const content = await readFileAsText(importFile)
-            const backup = parseBackupFile(content)
-            const result = await decryptBackup(backup, backupPassphrase)
-            setImportPreview(result.data)
-        } catch (err) {
-            setBackupError(err instanceof Error ? err.message : 'Erro ao decifrar')
-        } finally {
-            setBackupLoading(false)
-        }
-    }
-
-    const handleConfirmImport = async () => {
-        if (!importPreview) return
-
-        setBackupLoading(true)
-        setBackupError(null)
-
-        try {
-            await restoreFromBackup(importPreview)
-            setData(importPreview)
-            setShowBackupModal(null)
-            setBackupPassphrase('')
-            setImportFile(null)
-            setImportPreview(null)
-            setSaved(true)
-            setTimeout(() => setSaved(false), 2000)
-        } catch (err) {
-            setBackupError(err instanceof Error ? err.message : 'Erro ao importar')
-        } finally {
-            setBackupLoading(false)
-        }
-    }
-
-    // Cloud Sync functions
-    const handleSync = async () => {
-        if (backupPassphrase.length < 8) {
-            setBackupError('A senha deve ter pelo menos 8 caracteres')
-            return
-        }
-
-        setBackupLoading(true)
-        setBackupError(null)
-
-        try {
-            if (syncMode === 'push') {
-                await syncWalletToCloud(backupPassphrase)
-                setHasCloud(true)
-                setSaved(true) // Show success
-            } else {
-                const newData = await syncWalletFromCloud(backupPassphrase)
-                setData(newData)
-                setSaved(true) // Show success
-            }
-            setShowBackupModal(null)
-            setBackupPassphrase('')
-            setTimeout(() => setSaved(false), 2000)
-        } catch (err) {
-            setBackupError(err instanceof Error ? err.message : 'Erro na sincronização')
-        } finally {
-            setBackupLoading(false)
-        }
-    }
-
-    const closeBackupModal = () => {
-        setShowBackupModal(null)
-        setBackupPassphrase('')
-        setBackupConfirmPassphrase('')
-        setBackupError(null)
-        setImportFile(null)
-        setImportPreview(null)
-        setSyncMode(null)
     }
 
     const filledCount = FIELD_CONFIG.filter(f => data[f.key]).length
@@ -332,66 +213,14 @@ export default function WalletPage() {
                 <div>
                     <h1 className="text-2xl font-bold text-gray-900">Minha Carteira</h1>
                     <p className="text-gray-600 mt-1">
-                        {user ? 'Sincronização ativa' : 'Dados locais'}
+                        Seus dados ficam salvos apenas neste aparelho.
                     </p>
                 </div>
-                {user ? (
-                    <Button variant="ghost" size="sm" onClick={handleLogout}>
-                        <LogOut className="h-4 w-4 mr-2" />
-                        Sair
-                    </Button>
-                ) : (
-                    <Button size="sm" onClick={() => router.push('/subject/login')}>
-                        <User className="h-4 w-4 mr-2" />
-                        Entrar
-                    </Button>
-                )}
             </div>
 
-            {/* Cloud Sync Status */}
-            {user && (
-                <Card variant="bordered" className="bg-blue-50 border-blue-200">
-                    <CardContent className="p-4 flex items-center justify-between">
-                        <div className="flex items-center gap-3">
-                            <div className="p-2 bg-blue-100 rounded-full">
-                                <Cloud className="h-5 w-5 text-blue-600" />
-                            </div>
-                            <div>
-                                <p className="text-sm font-medium text-blue-900">Backup em Nuvem</p>
-                                <p className="text-xs text-blue-700">
-                                    {hasCloud ? 'Seus dados estão na nuvem' : 'Nenhum backup encontrado'}
-                                </p>
-                            </div>
-                        </div>
-                        <div className="flex gap-2">
-                            <Button
-                                size="sm"
-                                variant="outline"
-                                className="bg-white border-blue-200 hover:bg-blue-50"
-                                onClick={() => {
-                                    setSyncMode('push')
-                                    setShowBackupModal('sync')
-                                }}
-                            >
-                                <ArrowUp className="h-4 w-4 mr-1" />
-                                Salvar
-                            </Button>
-                            <Button
-                                size="sm"
-                                variant="outline"
-                                className="bg-white border-blue-200 hover:bg-blue-50"
-                                onClick={() => {
-                                    setSyncMode('pull')
-                                    setShowBackupModal('sync')
-                                }}
-                            >
-                                <ArrowDown className="h-4 w-4 mr-1" />
-                                Baixar
-                            </Button>
-                        </div>
-                    </CardContent>
-                </Card>
-            )}
+            <Alert variant="info">
+                Os dados são mantidos salvos localmente no seu aparelho, e nunca são vistos ou utilizados pelo MeuByte.
+            </Alert>
 
             {/* Progress */}
             <Card variant="bordered">
@@ -409,34 +238,6 @@ export default function WalletPage() {
                 </CardContent>
             </Card>
 
-            {saved && (
-                <Alert variant="success" className="flex items-center gap-2">
-                    <CheckCircle className="h-4 w-4" />
-                    Operação realizada com sucesso!
-                </Alert>
-            )}
-
-            {/* Backup Buttons (Offline) */}
-            <div className="flex gap-3">
-                <Button
-                    variant="outline"
-                    className="flex-1"
-                    onClick={() => setShowBackupModal('export')}
-                    disabled={filledCount === 0}
-                >
-                    <Download className="h-4 w-4" />
-                    Exportar Arquivo
-                </Button>
-                <Button
-                    variant="outline"
-                    className="flex-1"
-                    onClick={() => setShowBackupModal('import')}
-                >
-                    <Upload className="h-4 w-4" />
-                    Importar Arquivo
-                </Button>
-            </div>
-
             {/* Fields */}
             <Card variant="bordered">
                 <CardHeader className="border-b">
@@ -447,25 +248,79 @@ export default function WalletPage() {
                         const Icon = field.icon
                         const isEditing = editing === field.key
                         const value = data[field.key]
+                        const isBirthDate = field.key === 'birth_date'
+                        const normalizedBirthDate = isBirthDate ? normalizeValue('birth_date', editValue) : null
 
                         return (
                             <div key={field.key} className="p-4">
                                 {isEditing ? (
                                     <div className="space-y-3">
-                                        <div className="flex items-center gap-2 text-sm font-medium text-gray-700">
-                                            <Icon className="h-4 w-4 text-gray-400" />
-                                            {field.label}
+                                        <div className="flex items-center justify-between text-sm font-medium text-gray-700">
+                                            <div className="flex items-center gap-2">
+                                                <Icon className="h-4 w-4 text-gray-400" />
+                                                {field.label}
+                                            </div>
+                                            {savedField === field.key && (
+                                                <span className="text-xs text-emerald-600">Salvo ✓</span>
+                                            )}
                                         </div>
-                                        <Input
-                                            type={field.type}
-                                            value={editValue}
-                                            onChange={(e) => setEditValue(e.target.value)}
-                                            onBlur={commitEdit}
-                                            onKeyDown={handleEditKeyDown}
-                                            error={error || undefined}
-                                            autoFocus
-                                            ref={editInputRef}
-                                        />
+                                        {isBirthDate ? (
+                                            <div className="flex items-center gap-2">
+                                                <div className="flex-1">
+                                                    <Input
+                                                        type="text"
+                                                        placeholder="DD/MM/AAAA"
+                                                        value={editValue}
+                                                        onChange={(e) => setEditValue(formatBirthDateInput(e.target.value))}
+                                                        onBlur={() => commitEdit()}
+                                                        onKeyDown={handleEditKeyDown}
+                                                        error={error || undefined}
+                                                        autoFocus
+                                                        ref={editInputRef}
+                                                    />
+                                                </div>
+                                                <button
+                                                    type="button"
+                                                    onMouseDown={(event) => event.preventDefault()}
+                                                    onClick={() => {
+                                                        if (!datePickerRef.current) return
+                                                        if ('showPicker' in datePickerRef.current) {
+                                                            datePickerRef.current.showPicker()
+                                                        } else {
+                                                            datePickerRef.current.focus()
+                                                        }
+                                                    }}
+                                                    className="h-10 w-10 rounded-lg border border-gray-200 bg-white text-gray-600 hover:text-blue-600 hover:border-blue-200 transition-colors"
+                                                    aria-label="Abrir calendário"
+                                                    tabIndex={-1}
+                                                >
+                                                    <Calendar className="h-4 w-4 mx-auto" />
+                                                </button>
+                                                <input
+                                                    ref={datePickerRef}
+                                                    type="date"
+                                                    className="sr-only"
+                                                    value={normalizedBirthDate || ''}
+                                                    onChange={(event) => {
+                                                        const nextValue = event.target.value
+                                                        if (!nextValue) return
+                                                        setEditValue(formatBirthDateDisplay(nextValue))
+                                                        commitEdit(nextValue)
+                                                    }}
+                                                />
+                                            </div>
+                                        ) : (
+                                            <Input
+                                                type={field.type}
+                                                value={editValue}
+                                                onChange={(e) => setEditValue(e.target.value)}
+                                                onBlur={() => commitEdit()}
+                                                onKeyDown={handleEditKeyDown}
+                                                error={error || undefined}
+                                                autoFocus
+                                                ref={editInputRef}
+                                            />
+                                        )}
                                         <p className="text-xs text-gray-500">
                                             Salva automaticamente ao sair do campo.
                                         </p>
@@ -488,7 +343,12 @@ export default function WalletPage() {
                                                 </p>
                                             </div>
                                         </div>
-                                        <Edit2 className="h-4 w-4 text-gray-400 group-hover:text-blue-600" />
+                                        <div className="flex items-center gap-2">
+                                            {savedField === field.key && (
+                                                <span className="text-xs text-emerald-600">Salvo ✓</span>
+                                            )}
+                                            <Edit2 className="h-4 w-4 text-gray-400 group-hover:text-blue-600" />
+                                        </div>
                                     </button>
                                 )}
                             </div>
@@ -496,220 +356,6 @@ export default function WalletPage() {
                     })}
                 </CardContent>
             </Card>
-
-            {/* Info */}
-            <Alert variant="info">
-                <strong>Seus dados são armazenados localmente</strong> ou cifrados na nuvem (se logado) e só são compartilhados quando você autoriza.
-            </Alert>
-
-            {/* Export Modal */}
-            {showBackupModal === 'export' && (
-                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-                    <Card variant="elevated" className="w-full max-w-md">
-                        <CardHeader className="border-b">
-                            <CardTitle className="flex items-center gap-2">
-                                <Download className="h-5 w-5" />
-                                Exportar Backup
-                            </CardTitle>
-                        </CardHeader>
-                        <CardContent className="p-6 space-y-4">
-                            <Alert variant="warning">
-                                <AlertTriangle className="h-4 w-4 inline mr-2" />
-                                <strong>Atenção:</strong> Sem a senha correta, não será possível recuperar seus dados.
-                            </Alert>
-
-                            <Input
-                                type="password"
-                                label="Senha de Backup"
-                                placeholder="Mínimo 8 caracteres"
-                                value={backupPassphrase}
-                                onChange={(e) => setBackupPassphrase(e.target.value)}
-                            />
-
-                            <Input
-                                type="password"
-                                label="Confirmar Senha"
-                                placeholder="Digite novamente"
-                                value={backupConfirmPassphrase}
-                                onChange={(e) => setBackupConfirmPassphrase(e.target.value)}
-                            />
-
-                            {backupError && (
-                                <Alert variant="error">{backupError}</Alert>
-                            )}
-
-                            <div className="flex gap-3">
-                                <Button
-                                    className="flex-1"
-                                    onClick={handleExportBackup}
-                                    loading={backupLoading}
-                                >
-                                    <Download className="h-4 w-4" />
-                                    Baixar Backup
-                                </Button>
-                                <Button variant="outline" onClick={closeBackupModal}>
-                                    Cancelar
-                                </Button>
-                            </div>
-                        </CardContent>
-                    </Card>
-                </div>
-            )}
-
-            {/* Import Modal */}
-            {showBackupModal === 'import' && (
-                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-                    <Card variant="elevated" className="w-full max-w-md">
-                        <CardHeader className="border-b">
-                            <CardTitle className="flex items-center gap-2">
-                                <Upload className="h-5 w-5" />
-                                Importar Backup
-                            </CardTitle>
-                        </CardHeader>
-                        <CardContent className="p-6 space-y-4">
-                            {!importPreview ? (
-                                <>
-                                    <Alert variant="warning">
-                                        <AlertTriangle className="h-4 w-4 inline mr-2" />
-                                        <strong>Atenção:</strong> Importar um backup substituirá os dados atuais.
-                                    </Alert>
-
-                                    <div>
-                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                            Arquivo de Backup
-                                        </label>
-                                        <input
-                                            ref={fileInputRef}
-                                            type="file"
-                                            accept=".json"
-                                            onChange={handleFileSelect}
-                                            className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
-                                        />
-                                        {importFile && (
-                                            <p className="mt-2 text-sm text-gray-600">
-                                                Arquivo: {importFile.name}
-                                            </p>
-                                        )}
-                                    </div>
-
-                                    <Input
-                                        type="password"
-                                        label="Senha do Backup"
-                                        placeholder="Digite a senha usada na exportação"
-                                        value={backupPassphrase}
-                                        onChange={(e) => setBackupPassphrase(e.target.value)}
-                                    />
-
-                                    {backupError && (
-                                        <Alert variant="error">{backupError}</Alert>
-                                    )}
-
-                                    <div className="flex gap-3">
-                                        <Button
-                                            className="flex-1"
-                                            onClick={handleDecryptBackup}
-                                            loading={backupLoading}
-                                            disabled={!importFile}
-                                        >
-                                            Decifrar Backup
-                                        </Button>
-                                        <Button variant="outline" onClick={closeBackupModal}>
-                                            Cancelar
-                                        </Button>
-                                    </div>
-                                </>
-                            ) : (
-                                <>
-                                    <Alert variant="success">
-                                        <CheckCircle className="h-4 w-4 inline mr-2" />
-                                        Backup decifrado com sucesso!
-                                    </Alert>
-
-                                    <div>
-                                        <p className="text-sm font-medium text-gray-700 mb-2">
-                                            Campos encontrados ({Object.keys(importPreview).filter(k => importPreview[k]).length}):
-                                        </p>
-                                        <div className="bg-gray-50 rounded-lg p-3 text-sm space-y-1">
-                                            {Object.entries(importPreview).filter(([_, v]) => v).map(([key, value]) => (
-                                                <div key={key} className="flex justify-between">
-                                                    <span className="text-gray-500 capitalize">{key.replace(/_/g, ' ')}</span>
-                                                    <span className="text-gray-900">
-                                                        {key === 'cpf' ? '***.***.***-' + value!.slice(-2) : '••••••'}
-                                                    </span>
-                                                </div>
-                                            ))}
-                                        </div>
-                                    </div>
-
-                                    {backupError && (
-                                        <Alert variant="error">{backupError}</Alert>
-                                    )}
-
-                                    <div className="flex gap-3">
-                                        <Button
-                                            className="flex-1"
-                                            onClick={handleConfirmImport}
-                                            loading={backupLoading}
-                                        >
-                                            Confirmar Importação
-                                        </Button>
-                                        <Button variant="outline" onClick={closeBackupModal}>
-                                            Cancelar
-                                        </Button>
-                                    </div>
-                                </>
-                            )}
-                        </CardContent>
-                    </Card>
-                </div>
-            )}
-
-            {/* Sync Modal */}
-            {showBackupModal === 'sync' && (
-                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-                    <Card variant="elevated" className="w-full max-w-md">
-                        <CardHeader className="border-b">
-                            <CardTitle className="flex items-center gap-2">
-                                <Cloud className="h-5 w-5" />
-                                {syncMode === 'push' ? 'Salvar na Nuvem' : 'Baixar da Nuvem'}
-                            </CardTitle>
-                        </CardHeader>
-                        <CardContent className="p-6 space-y-4">
-                            <Alert variant={syncMode === 'push' ? 'info' : 'warning'}>
-                                {syncMode === 'push'
-                                    ? 'Seus dados serão cifrados com sua senha antes de sair do dispositivo.'
-                                    : 'Isso substituirá seus dados locais pelos dados da nuvem.'
-                                }
-                            </Alert>
-
-                            <Input
-                                type="password"
-                                label="Sua Senha de Criptografia"
-                                placeholder="Mínimo 8 caracteres"
-                                value={backupPassphrase}
-                                onChange={(e) => setBackupPassphrase(e.target.value)}
-                            />
-
-                            {backupError && (
-                                <Alert variant="error">{backupError}</Alert>
-                            )}
-
-                            <div className="flex gap-3">
-                                <Button
-                                    className="flex-1"
-                                    onClick={handleSync}
-                                    loading={backupLoading}
-                                >
-                                    {syncMode === 'push' ? 'Cifrar e Enviar' : 'Baixar e Decifrar'}
-                                </Button>
-                                <Button variant="outline" onClick={closeBackupModal}>
-                                    Cancelar
-                                </Button>
-                            </div>
-                        </CardContent>
-                    </Card>
-                </div>
-            )}
         </div>
     )
 }

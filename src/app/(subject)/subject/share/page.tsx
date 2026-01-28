@@ -2,13 +2,14 @@
 
 export const dynamic = 'force-dynamic'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, Button, Alert } from '@/components/ui'
 import { Copy, MessageCircle, CheckCircle, Clock, Lock } from 'lucide-react'
 import QRCode from 'qrcode'
 import { createClient } from '@/lib/supabase/client'
 import { getWalletData, hasWalletData, WalletData } from '@/lib/wallet'
 import { generateShareKey, exportKeyToString, encryptShareData } from '@/lib/crypto/zk-share'
+import { formatCPF, formatDate, formatPhone } from '@/lib/utils'
 
 interface SharePayload {
     meta: {
@@ -21,6 +22,39 @@ interface SharePayload {
         label: string
         value: string
     }>
+}
+
+type FieldProfile = 'pessoal' | 'saude' | 'veiculo' | 'extra'
+
+interface FieldOption {
+    slug: string
+    label: string
+    profile: FieldProfile
+}
+
+const BASE_FIELDS: FieldOption[] = [
+    { slug: 'full_name', label: 'Nome Completo', profile: 'pessoal' },
+    { slug: 'cpf', label: 'CPF', profile: 'pessoal' },
+    { slug: 'birth_date', label: 'Data de Nascimento', profile: 'pessoal' },
+    { slug: 'email', label: 'E-mail', profile: 'pessoal' },
+    { slug: 'phone', label: 'Telefone', profile: 'pessoal' },
+    { slug: 'address_line', label: 'Endereço', profile: 'pessoal' },
+    { slug: 'city', label: 'Cidade', profile: 'pessoal' },
+    { slug: 'state', label: 'Estado', profile: 'pessoal' },
+    { slug: 'postal_code', label: 'CEP', profile: 'pessoal' }
+]
+
+const PERSONAL_SLUGS = new Set(BASE_FIELDS.map((field) => field.slug))
+
+function profileForSlug(slug: string): FieldProfile {
+    if (PERSONAL_SLUGS.has(slug)) return 'pessoal'
+    if (slug.startsWith('emergency_') || slug.startsWith('health_') || slug.startsWith('medical_')) {
+        return 'saude'
+    }
+    if (slug.startsWith('vehicle_') || slug.startsWith('car_') || slug.includes('plate') || slug.includes('renavam')) {
+        return 'veiculo'
+    }
+    return 'extra'
 }
 
 // Generate a random ID for the share (UUID v4 style)
@@ -38,15 +72,31 @@ function formatLabel(slug: string) {
         address_line: 'Endereço',
         city: 'Cidade',
         state: 'Estado',
-        postal_code: 'CEP'
+        postal_code: 'CEP',
+        emergency_contact_name: 'Contato de Emergência',
+        emergency_contact_phone: 'Telefone de Emergência',
+        vehicle_plate: 'Placa do Veículo',
+        vehicle_model: 'Modelo do Veículo',
+        vehicle_color: 'Cor do Veículo',
+        vehicle_brand: 'Marca do Veículo',
+        vehicle_year: 'Ano do Veículo',
+        vehicle_vin: 'Chassi'
     }
     return labels[slug] || slug.replace(/_/g, ' ')
+}
+
+function formatValue(slug: string, value: string) {
+    if (slug === 'cpf') return formatCPF(value)
+    if (slug === 'phone' || slug === 'emergency_contact_phone') return formatPhone(value)
+    if (slug === 'birth_date') return formatDate(value)
+    return value
 }
 
 export default function SharePage() {
     const supabase = useMemo(() => createClient(), [])
     const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
     const keyRef = useRef<CryptoKey | null>(null)
+    const autoSentRef = useRef(false)
 
     const [walletData, setWalletData] = useState<WalletData>({})
     const [hasData, setHasData] = useState(false)
@@ -62,6 +112,23 @@ export default function SharePage() {
     const [expiresAt, setExpiresAt] = useState<number | null>(null)
     const [remaining, setRemaining] = useState<string | null>(null)
     const [error, setError] = useState<string | null>(null)
+    const [selectedFields, setSelectedFields] = useState<Record<string, boolean>>({})
+    const [activeProfile, setActiveProfile] = useState<FieldProfile | null>(null)
+    const [profileNotice, setProfileNotice] = useState<string | null>(null)
+    const profileNoticeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+    const fieldOptions = useMemo<FieldOption[]>(() => {
+        const extraFields = Object.keys(walletData)
+            .filter((slug) => !PERSONAL_SLUGS.has(slug))
+            .map((slug) => ({
+                slug,
+                label: formatLabel(slug),
+                profile: profileForSlug(slug)
+            }))
+            .sort((a, b) => a.label.localeCompare(b.label))
+
+        return [...BASE_FIELDS, ...extraFields]
+    }, [walletData])
 
     useEffect(() => {
         async function loadData() {
@@ -72,6 +139,26 @@ export default function SharePage() {
             setLoading(false)
         }
         loadData()
+    }, [])
+
+    useEffect(() => {
+        if (!fieldOptions.length) return
+        setSelectedFields((prev) => {
+            const next: Record<string, boolean> = {}
+            fieldOptions.forEach((field) => {
+                next[field.slug] = prev[field.slug] ?? true
+            })
+            return next
+        })
+    }, [fieldOptions])
+
+    useEffect(() => {
+        return () => {
+            if (profileNoticeTimeoutRef.current) {
+                clearTimeout(profileNoticeTimeoutRef.current)
+                profileNoticeTimeoutRef.current = null
+            }
+        }
     }, [])
 
     useEffect(() => {
@@ -101,6 +188,46 @@ export default function SharePage() {
         }
     }, [supabase])
 
+    const selectedFieldOptions = useMemo(
+        () => fieldOptions.filter((field) => selectedFields[field.slug]),
+        [fieldOptions, selectedFields]
+    )
+
+    const selectedFilledFields = useMemo(
+        () => selectedFieldOptions.filter((field) => walletData[field.slug]),
+        [selectedFieldOptions, walletData]
+    )
+
+    const showProfileNotice = useCallback((message: string) => {
+        setProfileNotice(message)
+        if (profileNoticeTimeoutRef.current) {
+            clearTimeout(profileNoticeTimeoutRef.current)
+        }
+        profileNoticeTimeoutRef.current = setTimeout(() => {
+            setProfileNotice(null)
+            profileNoticeTimeoutRef.current = null
+        }, 2500)
+    }, [])
+
+    const applyProfile = (profile: FieldProfile) => {
+        const groupFields = fieldOptions.filter((field) => field.profile === profile)
+        if (!groupFields.length) {
+            showProfileNotice('Nenhum dado desse perfil foi cadastrado ainda.')
+            return
+        }
+        const nextSelection: Record<string, boolean> = {}
+        fieldOptions.forEach((field) => {
+            nextSelection[field.slug] = groupFields.some((item) => item.slug === field.slug)
+        })
+        setSelectedFields(nextSelection)
+        setActiveProfile(profile)
+    }
+
+    const toggleFieldSelection = (slug: string) => {
+        setSelectedFields((prev) => ({ ...prev, [slug]: !prev[slug] }))
+        setActiveProfile(null)
+    }
+
     const setupChannel = (id: string) => {
         if (channelRef.current) {
             supabase.removeChannel(channelRef.current)
@@ -119,10 +246,15 @@ export default function SharePage() {
     }
 
     const generateLink = async () => {
+        if (!selectedFilledFields.length) {
+            setError('Selecione pelo menos um dado preenchido para compartilhar.')
+            return
+        }
         setGenerating(true)
         setError(null)
         setSent(false)
         setReceiverReady(false)
+        autoSentRef.current = false
 
         try {
             // 1. Generate local encryption key (never sent to server)
@@ -159,8 +291,12 @@ export default function SharePage() {
         }
     }
 
-    const sendPayload = async () => {
+    const sendPayload = useCallback(async () => {
         if (!keyRef.current || !channelRef.current || !shareId || !shareUrl) return
+        if (!selectedFilledFields.length) {
+            setError('Selecione pelo menos um dado preenchido para compartilhar.')
+            return
+        }
         if (expiresAt && Date.now() > expiresAt) {
             setError('Link expirado. Gere um novo.')
             return
@@ -170,17 +306,16 @@ export default function SharePage() {
         setError(null)
 
         try {
-            const filledFields = Object.entries(walletData).filter(([_, value]) => value)
             const payload: SharePayload = {
                 meta: {
                     createdAt: new Date().toISOString(),
                     expiresAt: new Date(expiresAt || Date.now()).toISOString(),
                     version: 1
                 },
-                fields: filledFields.map(([key, value]) => ({
-                    slug: key,
-                    label: formatLabel(key),
-                    value: value as string
+                fields: selectedFilledFields.map((field) => ({
+                    slug: field.slug,
+                    label: field.label,
+                    value: walletData[field.slug] as string
                 }))
             }
 
@@ -199,7 +334,14 @@ export default function SharePage() {
         } finally {
             setSending(false)
         }
-    }
+    }, [expiresAt, shareId, shareUrl, selectedFilledFields, walletData])
+
+    useEffect(() => {
+        if (!receiverReady || sent || sending) return
+        if (autoSentRef.current) return
+        autoSentRef.current = true
+        sendPayload()
+    }, [receiverReady, sent, sending, sendPayload])
 
     const copyLink = async () => {
         if (shareUrl) {
@@ -226,7 +368,9 @@ export default function SharePage() {
         )
     }
 
-    const filledFields = Object.entries(walletData).filter(([_, value]) => value)
+    const selectedCount = selectedFieldOptions.length
+    const totalCount = fieldOptions.length
+    const hasSelectedData = selectedFilledFields.length > 0
 
     return (
         <div className="py-6 space-y-6">
@@ -250,23 +394,94 @@ export default function SharePage() {
                 </Alert>
             ) : !shareId ? (
                 <>
-                    {/* Data Preview */}
+                    {/* Selection */}
                     <Card variant="bordered">
-                        <CardHeader>
-                            <CardTitle className="text-base">Dados a compartilhar</CardTitle>
+                        <CardHeader className="space-y-3">
+                            <div className="flex items-center justify-between">
+                                <CardTitle className="text-base">Selecione os dados</CardTitle>
+                                <span className="text-xs text-gray-500">
+                                    {selectedCount}/{totalCount} selecionados
+                                </span>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                                <button
+                                    type="button"
+                                    onClick={() => applyProfile('pessoal')}
+                                    className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
+                                        activeProfile === 'pessoal'
+                                            ? 'bg-blue-600 text-white border-blue-600'
+                                            : 'bg-white text-gray-700 border-gray-200 hover:border-blue-200 hover:text-blue-600'
+                                    }`}
+                                >
+                                    Pessoal
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => applyProfile('saude')}
+                                    className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
+                                        activeProfile === 'saude'
+                                            ? 'bg-blue-600 text-white border-blue-600'
+                                            : 'bg-white text-gray-700 border-gray-200 hover:border-blue-200 hover:text-blue-600'
+                                    }`}
+                                >
+                                    Saúde
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => applyProfile('veiculo')}
+                                    className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
+                                        activeProfile === 'veiculo'
+                                            ? 'bg-blue-600 text-white border-blue-600'
+                                            : 'bg-white text-gray-700 border-gray-200 hover:border-blue-200 hover:text-blue-600'
+                                    }`}
+                                >
+                                    Veículo
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => applyProfile('extra')}
+                                    className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
+                                        activeProfile === 'extra'
+                                            ? 'bg-blue-600 text-white border-blue-600'
+                                            : 'bg-white text-gray-700 border-gray-200 hover:border-blue-200 hover:text-blue-600'
+                                    }`}
+                                >
+                                    +
+                                </button>
+                            </div>
+                            {profileNotice && (
+                                <p className="text-xs text-gray-500">{profileNotice}</p>
+                            )}
                         </CardHeader>
                         <CardContent className="p-0">
                             <div className="divide-y divide-gray-100">
-                                {filledFields.map(([key, value]) => (
-                                    <div key={key} className="px-4 py-3 flex justify-between">
-                                        <span className="text-gray-500 capitalize">
-                                            {key.replace(/_/g, ' ')}
-                                        </span>
-                                        <span className="text-gray-900">
-                                            {key === 'cpf' ? '***.***.***-' + value!.slice(-2) : '••••••'}
-                                        </span>
-                                    </div>
-                                ))}
+                                {fieldOptions.map((field) => {
+                                    const value = walletData[field.slug] || ''
+                                    const isSelected = selectedFields[field.slug] ?? false
+                                    return (
+                                        <label
+                                            key={field.slug}
+                                            className="flex items-start gap-3 px-4 py-3 hover:bg-gray-50 cursor-pointer"
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                checked={isSelected}
+                                                onChange={() => toggleFieldSelection(field.slug)}
+                                                className="mt-1 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                            />
+                                            <div className="flex-1">
+                                                <p className="text-sm text-gray-500">{field.label}</p>
+                                                <p className="font-medium text-gray-900">
+                                                    {value ? (
+                                                        formatValue(field.slug, value)
+                                                    ) : (
+                                                        <span className="text-gray-400">Não preenchido</span>
+                                                    )}
+                                                </p>
+                                            </div>
+                                        </label>
+                                    )
+                                })}
                             </div>
                         </CardContent>
                     </Card>
@@ -276,10 +491,17 @@ export default function SharePage() {
                         size="lg"
                         onClick={generateLink}
                         loading={generating}
+                        disabled={!hasSelectedData}
                     >
                         <Lock className="h-4 w-4 mr-2" />
                         Gerar Link Seguro (E2E)
                     </Button>
+
+                    {!hasSelectedData && (
+                        <p className="text-xs text-gray-500 text-center">
+                            Selecione ao menos um dado preenchido para gerar o link.
+                        </p>
+                    )}
 
                     <Alert variant="info">
                         <Lock className="h-3 w-3 inline mr-2" />
@@ -334,16 +556,16 @@ export default function SharePage() {
                             <div className="mt-4">
                                 <Alert variant={receiverReady ? 'success' : 'info'}>
                                     {receiverReady
-                                        ? 'Receptor conectado. Envie os dados agora.'
+                                        ? 'Receptor conectado. Envio automático em andamento.'
                                         : 'Aguardando o receptor abrir o link.'}
                                 </Alert>
                                 <Button
                                     className="w-full mt-3"
                                     onClick={sendPayload}
                                     loading={sending}
-                                    disabled={!receiverReady || sent}
+                                    disabled={!receiverReady}
                                 >
-                                    {sent ? 'Dados enviados' : 'Enviar dados agora'}
+                                    {sent ? 'Reenviar dados' : 'Enviar dados agora'}
                                 </Button>
                             </div>
                         </CardContent>

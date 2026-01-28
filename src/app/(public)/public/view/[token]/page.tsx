@@ -29,6 +29,7 @@ export default function PublicViewPage() {
     const idArg = params.token as string // URL param is actually the ID now
     const supabase = useMemo(() => createClient(), [])
     const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
+    const readyIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
     const [step, setStep] = useState<'waiting' | 'viewing' | 'expired' | 'error'>('waiting')
     const [data, setData] = useState<SharePayload | null>(null)
@@ -39,6 +40,10 @@ export default function PublicViewPage() {
     useEffect(() => {
         setupChannel()
         return () => {
+            if (readyIntervalRef.current) {
+                clearInterval(readyIntervalRef.current)
+                readyIntervalRef.current = null
+            }
             if (channelRef.current) {
                 supabase.removeChannel(channelRef.current)
                 channelRef.current = null
@@ -54,6 +59,10 @@ export default function PublicViewPage() {
                 setStep('expired')
                 setExpiresIn('0 minutos')
                 setData(null)
+                if (readyIntervalRef.current) {
+                    clearInterval(readyIntervalRef.current)
+                    readyIntervalRef.current = null
+                }
                 clearInterval(interval)
                 return
             }
@@ -104,20 +113,35 @@ export default function PublicViewPage() {
                     const decryptedPayload = await decryptShareData(event.payload, key) as SharePayload
                     setData(decryptedPayload)
                     setStep('viewing')
+                    if (readyIntervalRef.current) {
+                        clearInterval(readyIntervalRef.current)
+                        readyIntervalRef.current = null
+                    }
                 } catch (err) {
                     console.error('Decryption error:', err)
                     setError('Falha na decifragem. A chave pode estar incorreta.')
                     setStep('error')
+                    if (readyIntervalRef.current) {
+                        clearInterval(readyIntervalRef.current)
+                        readyIntervalRef.current = null
+                    }
                 }
             })
 
             channel.subscribe((status) => {
                 if (status === 'SUBSCRIBED') {
-                    channel.send({
-                        type: 'broadcast',
-                        event: 'ready',
-                        payload: { at: new Date().toISOString() }
-                    })
+                    const sendReady = () => {
+                        channel.send({
+                            type: 'broadcast',
+                            event: 'ready',
+                            payload: { at: new Date().toISOString() }
+                        })
+                    }
+                    sendReady()
+                    if (readyIntervalRef.current) {
+                        clearInterval(readyIntervalRef.current)
+                    }
+                    readyIntervalRef.current = setInterval(sendReady, 5000)
                 }
             })
 

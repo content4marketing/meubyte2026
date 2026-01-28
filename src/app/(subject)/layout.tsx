@@ -38,12 +38,6 @@ export default function SubjectLayout({ children }: { children: React.ReactNode 
                         </svg>
                         <span className="text-xs">Compartilhar</span>
                     </Link>
-                    <Link href="/subject/history" className="flex flex-col items-center gap-1 px-4 py-2 text-gray-600 hover:text-blue-600 transition-colors">
-                        <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                        </svg>
-                        <span className="text-xs">Histórico</span>
-                    </Link>
                 </div>
             </nav>
         </div>
