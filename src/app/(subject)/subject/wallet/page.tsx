@@ -283,11 +283,15 @@ export default function WalletPage() {
                                                     type="button"
                                                     onMouseDown={(event) => event.preventDefault()}
                                                     onClick={() => {
-                                                        if (!datePickerRef.current) return
-                                                        if ('showPicker' in datePickerRef.current) {
-                                                            datePickerRef.current.showPicker()
+                                                        const input = datePickerRef.current
+                                                        if (!input) return
+                                                        const picker = (input as HTMLInputElement & {
+                                                            showPicker?: () => void
+                                                        }).showPicker
+                                                        if (typeof picker === 'function') {
+                                                            picker.call(input)
                                                         } else {
-                                                            datePickerRef.current.focus()
+                                                            input.focus()
                                                         }
                                                     }}
                                                     className="h-10 w-10 rounded-lg border border-gray-200 bg-white text-gray-600 hover:text-blue-600 hover:border-blue-200 transition-colors"
